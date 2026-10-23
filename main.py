@@ -89,6 +89,10 @@ class DittoApp:
 
         self.voice.start()
         prev_time = time.time()
+        window_name = "i-am-ditto // AI Face & Body AR Scanner"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
 
         try:
             while cap.isOpened():
@@ -140,7 +144,7 @@ class DittoApp:
                     typed_buffer=self.typed_buffer,
                 )
 
-                cv2.imshow("i-am-ditto // AI Face & Body AR Scanner", frame)
+                cv2.imshow(window_name, frame)
 
                 key = cv2.waitKey(5) & 0xFF
                 if key == 255:
