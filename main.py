@@ -4,8 +4,10 @@ i-am-ditto — Voice & AI Powered Real-Time Human Face & Body AR Transformer.
 Features:
 1. MediaPipe Holistic neon-green body pose (33), hand (42), and face (478) wireframe sticks.
 2. Voice command listener ("Hey I want to become Spider-Man", "Become <anything>").
-3. 3-Tier AI Avatar Resolver (Local Library -> Online Search -> AI Generator Fallback).
+3. 5-Tier AI Avatar Resolver (Local Library -> GitHub Repo Search -> Web Search -> AI Gen -> Procedural).
 4. Real-Time 3D Delaunay Triangle Mesh Warping (Instagram-style AR face filter).
+5. Full-Body Skeleton AR Overlay (adapted from ibaiGorordo/Mediapipe-Halloween-Examples).
+6. Automatic GitHub Sync (pushes newly discovered/generated avatars to lowjinghong29/i-am-ditto).
 """
 
 import argparse
@@ -15,6 +17,7 @@ import cv2
 
 from ai.avatar_resolver import AvatarResolver
 from ai.voice_listener import VoiceCommandListener
+from core.body_skeleton_ar import BodySkeletonOverlay
 from core.holistic_tracker import HolisticScanner, draw_futuristic_hud
 from core.mesh_warper import AvatarAsset, warp_avatar_onto_face
 
@@ -32,13 +35,15 @@ class DittoApp:
         self.sticks_enabled: bool = True
         self.face_wireframe_enabled: bool = True
         self.cutout_eyes_mouth: bool = False
+        self.body_skeleton_enabled: bool = False
 
         # In-window typing prompt state
         self.typing_mode: bool = False
         self.typed_buffer: str = ""
 
         self.scanner = HolisticScanner()
-        self.resolver = AvatarResolver(on_status_update=self._on_status)
+        self.skeleton_overlay = BodySkeletonOverlay()
+        self.resolver = AvatarResolver(on_status_update=self._on_status, auto_push_github=True)
         self.voice = VoiceCommandListener(
             on_command=self._on_voice_command,
             on_transcript=self._on_voice_transcript,
@@ -57,6 +62,7 @@ class DittoApp:
     def _on_voice_command(self, action: str, target: str) -> None:
         if action == "clear":
             self.active_avatar = None
+            self.body_skeleton_enabled = False
             self.face_wireframe_enabled = True
             self.ai_status = "Scanner Mode (Filter Cleared)"
         elif action == "become" and target:
@@ -64,9 +70,11 @@ class DittoApp:
 
     def request_avatar(self, character_name: str) -> None:
         """Trigger asynchronous AI resolution for any character name."""
+        if "skeleton" in character_name.lower():
+            self.body_skeleton_enabled = True
+
         def _apply_avatar(asset: AvatarAsset) -> None:
             self.active_avatar = asset
-            # Hide green face wireframe when wearing a character mask so the mask is crystal clear
             self.face_wireframe_enabled = False
 
         self.resolver.resolve_async(character_name, on_ready=_apply_avatar)
@@ -76,7 +84,6 @@ class DittoApp:
         if not cap.isOpened():
             raise RuntimeError(f"Could not open webcam at index {self.camera_index}")
 
-        # Set 720p resolution if supported by webcam
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -89,13 +96,16 @@ class DittoApp:
                 if not ok:
                     break
 
-                # Mirror frame for natural selfie interaction
                 frame = cv2.flip(frame, 1)
 
                 # 1. Scan Face + Body + Hands with MediaPipe Holistic
                 results = self.scanner.process(frame)
 
-                # 2. If an avatar is active and face is detected, warp 3D avatar mesh onto face
+                # 2. Optional Full-Body Skeleton AR Overlay (from Mediapipe-Halloween-Examples)
+                if self.body_skeleton_enabled and results.pose_landmarks:
+                    self.skeleton_overlay.draw(frame, results.pose_landmarks, include_skull=False)
+
+                # 3. If an avatar is active and face is detected, warp 3D avatar mesh onto face
                 if self.active_avatar is not None and results.face_landmarks:
                     warp_avatar_onto_face(
                         frame,
@@ -105,7 +115,7 @@ class DittoApp:
                         cutout_eyes_mouth=self.cutout_eyes_mouth,
                     )
 
-                # 3. Draw neon-green MediaPipe body & hand sticks (+ optional face mesh)
+                # 4. Draw neon-green MediaPipe body & hand sticks (+ optional face mesh)
                 self.scanner.draw_green_sticks(
                     frame,
                     results,
@@ -113,7 +123,7 @@ class DittoApp:
                     draw_body_and_hands=self.sticks_enabled,
                 )
 
-                # 4. Calculate FPS & draw Futuristic HUD
+                # 5. Calculate FPS & draw Futuristic HUD
                 now = time.time()
                 fps = 1.0 / max(now - prev_time, 1e-6)
                 prev_time = now
@@ -163,7 +173,6 @@ class DittoApp:
                 self.typed_buffer += chr(key)
             return False
 
-        # Standard shortcuts when not typing
         if key in (ord("q"), 27):
             return True
         if key in (ord("t"), ord("T")):
@@ -171,12 +180,15 @@ class DittoApp:
             self.typed_buffer = ""
         elif key in (ord("s"), ord("S")):
             self.sticks_enabled = not self.sticks_enabled
+        elif key in (ord("b"), ord("B")):
+            self.body_skeleton_enabled = not self.body_skeleton_enabled
         elif key in (ord("f"), ord("F")):
             self.face_wireframe_enabled = not self.face_wireframe_enabled
         elif key in (ord("e"), ord("E")):
             self.cutout_eyes_mouth = not self.cutout_eyes_mouth
         elif key in (ord("c"), ord("C")):
             self.active_avatar = None
+            self.body_skeleton_enabled = False
             self.face_wireframe_enabled = True
             self.ai_status = "Scanner Mode (Filter Cleared)"
         elif key == ord("1"):
@@ -187,6 +199,8 @@ class DittoApp:
             self.request_avatar("batman")
         elif key == ord("4"):
             self.request_avatar("joker")
+        elif key == ord("5"):
+            self.request_avatar("skeleton")
         return False
 
 
@@ -201,7 +215,7 @@ def process_static_image(
         raise FileNotFoundError(f"Could not read image at: {image_path}")
 
     scanner = HolisticScanner()
-    resolver = AvatarResolver()
+    resolver = AvatarResolver(auto_push_github=True)
     results = scanner.process(frame)
 
     resolved_holder = []

@@ -1,25 +1,28 @@
 """
-3-Tier AI Avatar Resolver for i-am-ditto.
+Multi-Tier AI Avatar Resolver for i-am-ditto.
 
 When a user says "Hey I want to become <character>", this module resolves the character into a
 3D-warpable AvatarAsset (BGRA texture + 84 source landmarks) without blocking the camera loop:
 
 - Tier 1: Local Disk Cache (`avatars/<slug>/texture.png` + `landmarks.npy`) -> <10ms
-- Tier 2: Online Image Search (DuckDuckGo Image Search + MediaPipe Face Quality Ranking) -> 1-2s
-- Tier 3: Generative AI Fallback (Pollinations Flux front-facing mask generator) -> 2-4s
-- Tier 4: Procedural Vector Mask Fallback (guarantees offline resilience)
+- Tier 2: GitHub Open-Source Repository Asset Search (`gh api search/code`) -> 1s
+- Tier 3: Online Web Image Search (DuckDuckGo Image Search + MediaPipe Face Quality Ranking) -> 1-2s
+- Tier 4: Generative AI Fallback (Pollinations Flux front-facing mask generator) -> 2-4s
+- Tier 5: Procedural Vector Mask Fallback (guarantees offline resilience)
+
+Automatically commits and pushes newly discovered avatars to GitHub (`lowjinghong29/i-am-ditto`).
 """
 
-import os
 import re
 import threading
 import urllib.parse
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 import cv2
 import numpy as np
 import requests
 
+from ai.github_sync import auto_push_avatar_async, search_github_mask_urls
 from core.mesh_warper import (
     CANONICAL_UV_ARRAY,
     AvatarAsset,
@@ -28,6 +31,7 @@ from core.mesh_warper import (
 
 
 AVATARS_DIR = Path(__file__).resolve().parent.parent / "avatars"
+ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
 
 def slugify(name: str) -> str:
@@ -36,10 +40,15 @@ def slugify(name: str) -> str:
 
 
 class AvatarResolver:
-    """Thread-safe asynchronous 3-tier AI resolver for any requested character."""
+    """Thread-safe asynchronous AI resolver for any requested character."""
 
-    def __init__(self, on_status_update: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        on_status_update: Optional[Callable[[str], None]] = None,
+        auto_push_github: bool = True,
+    ):
         self.on_status_update = on_status_update
+        self.auto_push_github = auto_push_github
         self._memory_cache: Dict[str, AvatarAsset] = {}
         self._lock = threading.Lock()
         AVATARS_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,16 +94,21 @@ class AvatarResolver:
             on_ready(cached_asset)
             return
 
-        # --- TIER 2: Online Search (DuckDuckGo Images + Face/Mask Scoring) ---
-        self._set_status(f"AI Agent: Searching online for '{clean_name}'...")
-        online_img = self._search_online_face(clean_name)
+        # --- TIER 2: GitHub Open-Source Repository Search ---
+        self._set_status(f"AI Agent: Searching GitHub repos for '{clean_name}'...")
+        online_img = self._search_github_face(clean_name)
 
-        # --- TIER 3: Generative AI Front-Facing Mask Fallback ---
+        # --- TIER 3: Online Web Search (DuckDuckGo Images + Face/Mask Scoring) ---
+        if online_img is None:
+            self._set_status(f"AI Agent: Searching web for '{clean_name}'...")
+            online_img = self._search_online_face(clean_name)
+
+        # --- TIER 4: Generative AI Front-Facing Mask Fallback ---
         if online_img is None:
             self._set_status(f"AI Agent: Generating 3D mask for '{clean_name}'...")
             online_img = self._generate_ai_face(clean_name)
 
-        # --- TIER 4: Procedural Hero Mask Fallback (if completely offline) ---
+        # --- TIER 5: Procedural Hero Mask Fallback (if completely offline) ---
         if online_img is None:
             self._set_status(f"AI Agent: Synthesizing mask for '{clean_name}'...")
             online_img = self._create_procedural_mask(clean_name)
@@ -118,6 +132,9 @@ class AvatarResolver:
         mode_tag = "Mask UV" if is_canonical else "FaceMesh"
         self._set_status(f"Active: {asset.name} ({mode_tag})")
         on_ready(asset)
+
+        if self.auto_push_github:
+            auto_push_avatar_async(slug, asset.name, on_status=self._set_status)
 
     def _load_from_disk(self, name: str, slug: str) -> Optional[AvatarAsset]:
         folder = AVATARS_DIR / slug
@@ -155,6 +172,15 @@ class AvatarResolver:
             encoding="utf-8",
         )
 
+    def _search_github_face(self, character_name: str) -> Optional[np.ndarray]:
+        """Search public GitHub repositories for pre-made character mask PNGs."""
+        urls = search_github_mask_urls(character_name, limit=4)
+        for url in urls:
+            img = self._download_image_bgra(url, timeout=4.0)
+            if img is not None and img.shape[0] >= 128 and img.shape[1] >= 128:
+                return self._normalize_size(img, 512)
+        return None
+
     def _search_online_face(self, character_name: str) -> Optional[np.ndarray]:
         """Search online for a clean front-facing character face or mask."""
         try:
@@ -184,11 +210,9 @@ class AvatarResolver:
                 if h < 180 or w < 180:
                     continue
 
-                # Resize to standard 512px max dimension for fast warping
                 img = self._normalize_size(img, 512)
                 pts, is_canonical = extract_avatar_landmarks(img)
                 if not is_canonical:
-                    # Found a real human/humanoid face with verified MediaPipe landmarks!
                     return img
                 if best_fallback is None:
                     best_fallback = img
@@ -244,23 +268,30 @@ class AvatarResolver:
         return img_bgra
 
     def _ensure_builtin_starters(self) -> None:
-        """Pre-create high-precision starter masks (Spider-Man, Iron Man, Batman, Cyber) if not cached."""
-        starters = ["spiderman", "iron man", "batman", "joker"]
+        """Pre-create starter masks (Spider-Man, Iron Man, Batman, Joker, Skeleton) if not cached."""
+        starters = ["spiderman", "iron man", "batman", "joker", "skeleton"]
         for name in starters:
             slug = slugify(name)
             folder = AVATARS_DIR / slug
             if not (folder / "texture.png").exists():
-                mask_img = self._create_procedural_mask(name)
-                pts = np.zeros_like(CANONICAL_UV_ARRAY, dtype=np.float32)
-                h, w = mask_img.shape[:2]
-                pts[:, 0] = CANONICAL_UV_ARRAY[:, 0] * w
-                pts[:, 1] = CANONICAL_UV_ARRAY[:, 1] * h
+                if name == "skeleton" and (ASSETS_DIR / "skeleton" / "skull.png").exists():
+                    skull = cv2.imread(str(ASSETS_DIR / "skeleton" / "skull.png"), cv2.IMREAD_UNCHANGED)
+                    if skull is not None:
+                        if skull.shape[2] == 3:
+                            skull = cv2.cvtColor(skull, cv2.COLOR_BGR2BGRA)
+                        mask_img = self._normalize_size(skull, 512)
+                    else:
+                        mask_img = self._create_procedural_mask(name)
+                else:
+                    mask_img = self._create_procedural_mask(name)
+
+                pts, is_canonical = extract_avatar_landmarks(mask_img)
                 asset = AvatarAsset(
                     name=name.title(),
                     slug=slug,
                     texture_bgra=mask_img,
                     source_points=pts,
-                    is_canonical_mask=True,
+                    is_canonical_mask=is_canonical,
                 )
                 self._save_to_disk(asset)
 
@@ -273,20 +304,15 @@ class AvatarResolver:
         img = np.zeros((size, size, 4), dtype=np.uint8)
         lower = character_name.lower()
 
-        # Outer face oval polygon in 512x512 UV space
         oval_uv = (CANONICAL_UV_ARRAY[:36] * size).astype(np.int32)
         hull = cv2.convexHull(oval_uv)
 
         if "spider" in lower:
-            # Classic Crimson Spider-Man Mask with Webbing & White Lenses
-            cv2.fillConvexPoly(img, hull, (30, 25, 215, 255))  # Rich Spider-Man Red (BGR)
-
-            # Shading along jaw/temples
+            cv2.fillConvexPoly(img, hull, (30, 25, 215, 255))
             shade = np.zeros_like(img)
             cv2.polylines(shade, [hull], True, (15, 10, 120, 255), 28, cv2.LINE_AA)
             img = cv2.addWeighted(img, 0.85, shade, 0.35, 0)
 
-            # Radial web lines from nose bridge (0.50, 0.45)
             center = (int(0.50 * size), int(0.44 * size))
             for angle_deg in range(0, 360, 22):
                 rad = np.deg2rad(angle_deg)
@@ -294,11 +320,9 @@ class AvatarResolver:
                 end_y = int(center[1] + np.sin(rad) * size * 0.55)
                 cv2.line(img, center, (end_x, end_y), (20, 20, 25, 255), 2, cv2.LINE_AA)
 
-            # Concentric web rings
             for r in range(36, 280, 38):
                 cv2.circle(img, center, r, (20, 20, 25, 255), 2, cv2.LINE_AA)
 
-            # Iconic Spider-Man Bold Black Eye Frames & White Lenses
             left_lens = np.array(
                 [[85, 170], [135, 148], [208, 192], [182, 226], [112, 212]],
                 dtype=np.int32,
@@ -311,8 +335,7 @@ class AvatarResolver:
             cv2.polylines(img, [left_lens, right_lens], True, (12, 12, 15, 255), 12, cv2.LINE_AA)
 
         elif "iron" in lower:
-            # Iron Man Mark LXXXV Red & Gold Helmet
-            cv2.fillConvexPoly(img, hull, (25, 30, 185, 255))  # Metallic Crimson
+            cv2.fillConvexPoly(img, hull, (25, 30, 185, 255))
             faceplate = np.array(
                 [
                     [95, 95], [200, 125], [312, 125], [417, 95],
@@ -321,46 +344,36 @@ class AvatarResolver:
                 ],
                 dtype=np.int32,
             )
-            cv2.fillPoly(img, [faceplate], (45, 190, 245, 255))  # Gold Alloy (BGR)
+            cv2.fillPoly(img, [faceplate], (45, 190, 245, 255))
             cv2.polylines(img, [faceplate], True, (20, 25, 90, 255), 5, cv2.LINE_AA)
 
-            # Glowing Cyan Arc-Reactor Eyes
             l_eye = np.array([[105, 190], [200, 195], [190, 215], [115, 210]], dtype=np.int32)
             r_eye = np.array([[407, 190], [312, 195], [322, 215], [397, 210]], dtype=np.int32)
             cv2.fillPoly(img, [l_eye, r_eye], (255, 245, 180, 255))
             cv2.polylines(img, [l_eye, r_eye], True, (255, 200, 0, 255), 6, cv2.LINE_AA)
 
-            # Jaw slit line
             jaw_line = np.array([[155, 395], [210, 380], [302, 380], [357, 395]], dtype=np.int32)
             cv2.polylines(img, [jaw_line], False, (20, 20, 30, 255), 6, cv2.LINE_AA)
 
         elif "bat" in lower:
-            # Dark Knight Tactical Cowl (Covers forehead, eyes, nose; exposes lower jaw/mouth)
             cv2.fillConvexPoly(img, hull, (28, 28, 32, 255))
-            # Cut out lower mouth area for classic Batman cowl look
             mouth_cut = np.array(
                 [[140, 345], [256, 325], [372, 345], [345, 485], [256, 505], [167, 485]],
                 dtype=np.int32,
             )
             cv2.fillPoly(img, [mouth_cut], (150, 175, 210, 255))
-            # Glowing white tactical eyes
             l_eye = np.array([[105, 188], [195, 196], [180, 216], [115, 210]], dtype=np.int32)
             r_eye = np.array([[407, 188], [317, 196], [332, 216], [397, 210]], dtype=np.int32)
             cv2.fillPoly(img, [l_eye, r_eye], (250, 250, 255, 255))
-            # Brow ridges
             cv2.line(img, (95, 170), (225, 190), (65, 65, 75, 255), 5, cv2.LINE_AA)
             cv2.line(img, (417, 170), (287, 190), (65, 65, 75, 255), 5, cv2.LINE_AA)
 
         elif "joker" in lower:
-            # Classic Clown Prince Face Paint
             cv2.fillConvexPoly(img, hull, (235, 238, 242, 255))
-            # Blue diamond eye paint
             l_diamond = np.array([[150, 130], [210, 195], [150, 265], [95, 195]], dtype=np.int32)
             r_diamond = np.array([[362, 130], [417, 195], [362, 265], [302, 195]], dtype=np.int32)
             cv2.fillPoly(img, [l_diamond, r_diamond], (190, 95, 20, 255))
-            # Red nose tip
             cv2.circle(img, (256, 305), 32, (25, 20, 210, 255), -1, cv2.LINE_AA)
-            # Glasgow smile
             smile = np.array(
                 [[105, 345], [175, 390], [256, 405], [337, 390], [407, 345], [340, 435], [256, 450], [172, 435]],
                 dtype=np.int32,
@@ -368,14 +381,12 @@ class AvatarResolver:
             cv2.fillPoly(img, [smile], (20, 15, 215, 255))
 
         else:
-            # Deterministic Cyber-Hero Mask based on character name hash
             seed = sum(ord(c) * (i + 1) for i, c in enumerate(lower))
             hue = seed % 180
             hsv_base = np.uint8([[[hue, 210, 210]]])
             bgr_base = cv2.cvtColor(hsv_base, cv2.COLOR_HSV2BGR)[0, 0].tolist()
             cv2.fillConvexPoly(img, hull, (*bgr_base, 255))
 
-            # Visor & Cyber circuitry
             visor = np.array([[85, 165], [256, 190], [427, 165], [405, 230], [256, 245], [107, 230]], dtype=np.int32)
             cv2.fillPoly(img, [visor], (255, 255, 0, 255))
             cv2.polylines(img, [visor], True, (20, 20, 20, 255), 6, cv2.LINE_AA)

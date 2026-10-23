@@ -14,8 +14,7 @@ env/
 .DS_Store
 Thumbs.db
 
-# Runtime generated outputs & dynamic avatar cache
+# Runtime test outputs
 output_*.jpg
 output_*.png
 output_*.mp4
-avatars/
