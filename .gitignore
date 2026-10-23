@@ -14,8 +14,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Output media
+# Runtime generated outputs & dynamic avatar cache
 output_*.jpg
 output_*.png
 output_*.mp4
-*.json
+avatars/
